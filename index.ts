@@ -6,6 +6,8 @@ import type {
 	Tool as AnthropicTool,
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { AnthropicVertex } from "@anthropic-ai/vertex-sdk";
+import { GoogleAuth } from "google-auth-library";
+import type { AuthClient } from "google-auth-library";
 import {
 	type Api,
 	type AssistantMessage,
@@ -30,6 +32,130 @@ import {
 } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
 
+// Inlined from @mariozechner/pi-ai/dist/providers/transform-messages.js.
+//
+// Every Anthropic-shaped provider in pi-ai (anthropic, bedrock, google-*) runs this
+// pre-pass before serializing messages. It does two things this provider needs:
+//   1. Drop assistant messages with stopReason "error" / "aborted" entirely, so an
+//      incomplete turn (e.g. a tool_use the user cancelled mid-call) never replays.
+//   2. Insert synthetic "No result provided" tool_result messages for any tool_use
+//      that lacks a matching tool_result before the next user/assistant message.
+//
+// Without this, Anthropic Vertex rejects the request with:
+//   `tool_use` ids were found without `tool_result` blocks immediately after.
+//
+// We inline rather than deep-import because the pi extension loader resolves the
+// import against the package's `main` file path, which mangles `dist/...` subpaths.
+function transformMessages<TApi extends Api>(
+	messages: Message[],
+	model: Model<TApi>,
+	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
+): Message[] {
+	const toolCallIdMap = new Map<string, string>();
+
+	const transformed = messages.map((msg) => {
+		if (msg.role === "user") return msg;
+
+		if (msg.role === "toolResult") {
+			const normalizedId = toolCallIdMap.get(msg.toolCallId);
+			if (normalizedId && normalizedId !== msg.toolCallId) {
+				return { ...msg, toolCallId: normalizedId };
+			}
+			return msg;
+		}
+
+		if (msg.role === "assistant") {
+			const assistantMsg = msg as AssistantMessage;
+			const isSameModel =
+				assistantMsg.provider === model.provider &&
+				assistantMsg.api === model.api &&
+				assistantMsg.model === model.id;
+
+			const transformedContent = assistantMsg.content.flatMap((block) => {
+				if (block.type === "thinking") {
+					if (isSameModel && block.thinkingSignature) return block;
+					if (!block.thinking || block.thinking.trim() === "") return [];
+					if (isSameModel) return block;
+					return { type: "text" as const, text: block.thinking };
+				}
+				if (block.type === "text") {
+					if (isSameModel) return block;
+					return { type: "text" as const, text: block.text };
+				}
+				if (block.type === "toolCall") {
+					const toolCall = block as ToolCall;
+					let normalized: ToolCall = toolCall;
+					if (!isSameModel && toolCall.thoughtSignature) {
+						normalized = { ...toolCall };
+						delete (normalized as { thoughtSignature?: string }).thoughtSignature;
+					}
+					if (!isSameModel && normalizeToolCallId) {
+						const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
+						if (normalizedId !== toolCall.id) {
+							toolCallIdMap.set(toolCall.id, normalizedId);
+							normalized = { ...normalized, id: normalizedId };
+						}
+					}
+					return normalized;
+				}
+				return block;
+			});
+
+			return { ...assistantMsg, content: transformedContent };
+		}
+		return msg;
+	});
+
+	const result: Message[] = [];
+	let pendingToolCalls: ToolCall[] = [];
+	let existingToolResultIds = new Set<string>();
+
+	const flushOrphans = () => {
+		for (const tc of pendingToolCalls) {
+			if (!existingToolResultIds.has(tc.id)) {
+				result.push({
+					role: "toolResult",
+					toolCallId: tc.id,
+					toolName: tc.name,
+					content: [{ type: "text", text: "No result provided" }],
+					isError: true,
+					timestamp: Date.now(),
+				} as ToolResultMessage);
+			}
+		}
+		pendingToolCalls = [];
+		existingToolResultIds = new Set();
+	};
+
+	for (const msg of transformed) {
+		if (msg.role === "assistant") {
+			if (pendingToolCalls.length > 0) flushOrphans();
+
+			const assistantMsg = msg as AssistantMessage;
+			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				continue;
+			}
+
+			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
+			if (toolCalls.length > 0) {
+				pendingToolCalls = toolCalls;
+				existingToolResultIds = new Set();
+			}
+			result.push(msg);
+		} else if (msg.role === "toolResult") {
+			existingToolResultIds.add(msg.toolCallId);
+			result.push(msg);
+		} else if (msg.role === "user") {
+			if (pendingToolCalls.length > 0) flushOrphans();
+			result.push(msg);
+		} else {
+			result.push(msg);
+		}
+	}
+
+	return result;
+}
+
 const DEFAULT_REGION = "us-east5";
 const BASE_URL = "https://{region}-aiplatform.googleapis.com";
 
@@ -51,6 +177,24 @@ const MODELS: ProviderModelConfig[] = [
 		cost: { input: 15, output: 75, cacheRead: 0.5, cacheWrite: 6.25 },
 		contextWindow: 200000,
 		maxTokens: 32000,
+	},
+	{
+		id: "claude-fable-5@default",
+		name: "Claude Fable 5 (Vertex AI)",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+		contextWindow: 1000000,
+		maxTokens: 128000,
+	},
+	{
+		id: "claude-opus-5@default",
+		name: "Claude Opus 5 (Vertex AI)",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+		contextWindow: 1000000,
+		maxTokens: 128000,
 	},
 	{
 		id: "claude-opus-4-8@default",
@@ -176,7 +320,7 @@ function mergeHeaders(...sources: Array<Record<string, string> | undefined>): Re
 }
 
 function supportsAdaptiveThinking(modelId: string): boolean {
-	return ["opus-4-6", "opus-4-7", "opus-4-8"].some((id) => modelId.includes(id));
+	return ["opus-4-6", "opus-4-7", "opus-4-8", "opus-5"].some((id) => modelId.includes(id));
 }
 
 function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"]): AnthropicVertexEffort {
@@ -274,9 +418,13 @@ function convertMessages(
 	cacheControl?: { type: "ephemeral"; ttl?: "1h" },
 ): MessageParam[] {
 	const params: MessageParam[] = [];
+	// Pre-pass: drop aborted/errored assistant turns and inject synthetic tool_result
+	// blocks for any orphaned tool_use, so the API never sees a tool_use without a
+	// matching tool_result in the next message.
+	const transformed = transformMessages(messages, model, normalizeToolCallId);
 
-	for (let i = 0; i < messages.length; i++) {
-		const msg = messages[i];
+	for (let i = 0; i < transformed.length; i++) {
+		const msg = transformed[i];
 
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
@@ -355,8 +503,8 @@ function convertMessages(
 			});
 
 			let j = i + 1;
-			while (j < messages.length && messages[j].role === "toolResult") {
-				const next = messages[j] as ToolResultMessage;
+			while (j < transformed.length && transformed[j].role === "toolResult") {
+				const next = transformed[j] as ToolResultMessage;
 				toolResults.push({
 					type: "tool_result",
 					tool_use_id: next.toolCallId,
@@ -385,6 +533,13 @@ function convertMessages(
 	}
 
 	return params;
+}
+
+// Anthropic tool_use IDs must match ^[a-zA-Z0-9_-]+$ and be <= 64 chars.
+// Used by transformMessages to rewrite IDs from foreign providers (e.g. OpenAI Responses).
+function normalizeToolCallId(id: string): string {
+	const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+	return sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
 }
 
 function convertTools(tools: Tool[] | undefined): AnthropicTool[] {
@@ -449,8 +604,8 @@ function resolveProject(options?: AnthropicVertexOptions): string | undefined {
 }
 
 function resolveRegion(model: Model<Api>, options?: AnthropicVertexOptions): string {
-        // Opus 4.7 and 4.8 are only available in "global" right now
-	if (["opus-4-7", "opus-4-8"].some((id) => model.id.includes(id))) {
+        // Opus 4.7, 4.8 and 5 are only available in "global" right now
+	if (["opus-4-7", "opus-4-8", "opus-5"].some((id) => model.id.includes(id))) {
 		return "global";
 	}
 	return (
@@ -459,6 +614,89 @@ function resolveRegion(model: Model<Api>, options?: AnthropicVertexOptions): str
 		process.env.CLOUD_ML_REGION ??
 		DEFAULT_REGION
 	);
+}
+
+// The Vertex SDK authenticates each request by POSTing to
+// https://oauth2.googleapis.com/token via google-auth-library. That fetch runs
+// *before* the Anthropic SDK's own retry loop, so a transient socket error
+// (ECONNRESET / ETIMEDOUT / EAI_AGAIN) on the token endpoint fails the whole
+// stream with a bare "request to .../token failed, reason:" and is never retried.
+//
+// We share one GoogleAuth across requests (so the access token is cached instead
+// of refetched per stream) and wrap getRequestHeaders/getAccessToken with a small
+// exponential backoff so a single network blip no longer kills the turn.
+const TOKEN_RETRY_ATTEMPTS = 3;
+const TOKEN_RETRY_BASE_MS = 250;
+
+function isTransientAuthError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	const code = (error as { code?: string } | undefined)?.code;
+	const causeCode = (error as { cause?: { code?: string } } | undefined)?.cause?.code;
+	return (
+		/oauth2\.googleapis\.com\/token/i.test(message) ||
+		/ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|socket hang up|network|fetch failed|timed? ?out/i.test(message) ||
+		[code, causeCode].some(
+			(c) => c === "ECONNRESET" || c === "ETIMEDOUT" || c === "EAI_AGAIN" || c === "ENOTFOUND" || c === "ECONNREFUSED",
+		)
+	);
+}
+
+async function withTokenRetry<T>(fn: () => Promise<T>): Promise<T> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < TOKEN_RETRY_ATTEMPTS; attempt++) {
+		try {
+			return await fn();
+		} catch (error) {
+			lastError = error;
+			if (attempt === TOKEN_RETRY_ATTEMPTS - 1 || !isTransientAuthError(error)) {
+				throw error;
+			}
+			const delay = TOKEN_RETRY_BASE_MS * 2 ** attempt + Math.floor(Math.random() * 100);
+			await new Promise((resolve) => setTimeout(resolve, delay));
+		}
+	}
+	throw lastError;
+}
+
+// Wraps the resolved AuthClient so its token fetches retry on transient errors.
+// We delegate via Proxy so every other method/property stays identical to the
+// underlying client (the Vertex SDK only calls getRequestHeaders, but this keeps
+// behavior intact if that changes).
+function wrapAuthClientWithRetry(client: AuthClient): AuthClient {
+	return new Proxy(client, {
+		get(target, prop, receiver) {
+			if (prop === "getRequestHeaders") {
+				return (...args: unknown[]) =>
+					withTokenRetry(() => (target.getRequestHeaders as (...a: unknown[]) => Promise<unknown>)(...args));
+			}
+			if (prop === "getAccessToken") {
+				return (...args: unknown[]) =>
+					withTokenRetry(() => (target.getAccessToken as (...a: unknown[]) => Promise<unknown>)(...args));
+			}
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+// One GoogleAuth instance shared across all clients. getClient() caches the
+// resolved AuthClient, which in turn caches the access token until it expires.
+let sharedGoogleAuth: GoogleAuth | undefined;
+
+function getSharedGoogleAuth(): GoogleAuth {
+	if (!sharedGoogleAuth) {
+		const base = new GoogleAuth({ scopes: "https://www.googleapis.com/auth/cloud-platform" });
+		// Wrap getClient so the AuthClient it hands to the Vertex SDK has retrying
+		// token fetches. getClient itself can also touch the network (ADC
+		// discovery), so retry it too.
+		const originalGetClient = base.getClient.bind(base);
+		base.getClient = (() =>
+			withTokenRetry(originalGetClient).then((client) =>
+				wrapAuthClientWithRetry(client as AuthClient),
+			)) as typeof base.getClient;
+		sharedGoogleAuth = base;
+	}
+	return sharedGoogleAuth;
 }
 
 function createClient(model: Model<Api>, options?: AnthropicVertexOptions): AnthropicVertex {
@@ -476,6 +714,7 @@ function createClient(model: Model<Api>, options?: AnthropicVertexOptions): Anth
 	return new AnthropicVertex({
 		projectId: project,
 		region: resolveRegion(model, options),
+		googleAuth: getSharedGoogleAuth(),
 		defaultHeaders: mergeHeaders(
 			{
 				accept: "application/json",
@@ -782,11 +1021,19 @@ const streamSimpleAnthropicVertexStandalone: StreamFunction<Api, SimpleStreamOpt
 };
 
 export default function registerAnthropicVertex(pi: ExtensionAPI): void {
+	// Resolve the project ID once at registration time. Previously this used a
+	// `!sh -lc '...'` apiKey, which pi re-executes via execSync on every prompt
+	// submission (resolveConfigValueUncached bypasses the cache), causing a
+	// ~1-2s pause on Enter due to spawning sh + gcloud each time.
+	//
+	// The Vertex SDK authenticates via google-auth-library / ADC, not this
+	// apiKey value. pi only needs *some* truthy string here for hasConfiguredAuth
+	// bookkeeping, so we hand it the already-resolved project ID as a literal.
+	const resolvedProject = resolveProject();
 	pi.registerProvider("anthropic-vertex", {
 		baseUrl: BASE_URL,
 		api: "anthropic-vertex",
-		apiKey:
-			"!sh -lc 'printf %s \"${ANTHROPIC_VERTEX_PROJECT_ID:-${GOOGLE_CLOUD_PROJECT:-${GCLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null)}}}\"'",
+		...(resolvedProject ? { apiKey: resolvedProject } : {}),
 		models: MODELS,
 		streamSimple: streamSimpleAnthropicVertexStandalone,
 	});
